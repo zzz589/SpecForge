@@ -1,0 +1,62 @@
+model:
+  target_model_path: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/models/Qwen3-1.7B"
+  draft_model_config: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/src/SpecForge-main/configs/local/qwen3-1.7b-dflash-5layer.json"
+  draft_checkpoint_path: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/outputs/qwen3-1.7b-dflash-online-dp1-100k-20261027-cuda132/qwen3-1.7b-dflash-online-dp1-100k-20261027-cuda132-latest"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  mask_token_id: 151669
+
+data:
+  prompts_path: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/data/qwen3-1.7b-dflash/mapped/train_dedup_plus_ultrachat_extra_20261027/train.prompts.jsonl"
+  max_length: 3072
+  chat_template: "qwen"
+  is_preformatted: true
+  train_only_last_turn: false
+  build_dataset_num_proc: 16
+  dataloader_num_workers: 4
+  cache_dir: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/outputs/qwen3-1.7b-dflash-online-dp1-warm20k-extra80k-20261027/cache"
+
+training:
+  strategy: "dflash"
+  num_epochs: 10
+  max_steps: 80000
+  batch_size: 2
+  learning_rate: 0.0001
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 500
+  max_checkpoints: 3
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: "none"
+
+run_id: "qwen3-1.7b-dflash-online-dp1-warm20k-extra80k-20261027"
+output_dir: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/outputs/qwen3-1.7b-dflash-online-dp1-warm20k-extra80k-20261027"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_8/xj/outputs/qwen3-1.7b-dflash-online-dp1-warm20k-extra80k-20261027/control"
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 1073741824
+      capture_servers:
+        - port: 30017
+          cuda_visible_devices: ["1"]
+          tp_size: 1
+          mem_fraction_static: 0.5

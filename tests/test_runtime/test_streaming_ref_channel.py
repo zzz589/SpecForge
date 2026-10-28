@@ -206,6 +206,33 @@ class TestStreamingRefChannel(unittest.TestCase):
         w.publish(_ref("s0"))
         self.assertEqual([x.sample_id for x in r2.poll()], ["s0"])
 
+    def test_transient_malformed_complete_line_is_retried_from_record_boundary(self):
+        reader = StreamingRefChannel(self.path)
+        # Simulate a stale shared-filesystem read that briefly exposes two
+        # fragments as one newline-terminated record.
+        with open(self.path, "wb") as stream:
+            stream.write(b'{"stale":1}{"duplicate":2}\n')
+
+        self.assertEqual(reader.poll(), [])
+
+        # The next read from the same byte offset sees the committed record.
+        with open(self.path, "wb") as stream:
+            stream.write(b"")
+        writer = StreamingRefChannel(self.path)
+        writer.publish(_ref("s0"))
+
+        self.assertEqual([ref.sample_id for ref in reader.poll()], ["s0"])
+
+    def test_persistently_malformed_complete_line_still_fails(self):
+        reader = StreamingRefChannel(self.path)
+        with open(self.path, "wb") as stream:
+            stream.write(b'{"broken":1}{"still":"broken"}\n')
+
+        for _ in range(3):
+            self.assertEqual(reader.poll(), [])
+        with self.assertRaisesRegex(RuntimeError, "remained invalid after 3 retries"):
+            reader.poll()
+
     def test_max_n_limits_batch(self):
         w = StreamingRefChannel(self.path)
         r = StreamingRefChannel(self.path)

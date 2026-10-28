@@ -55,6 +55,7 @@ _FAILED_SUFFIX = ".failed"
 _CONSUMER_DONE_SUFFIX = ".consumer_done"
 _CONSUMER_FAILED_SUFFIX = ".consumer_failed"
 _CONSUMER_QUANTUM_SUFFIX = ".consumer_quantum"
+_MAX_TRANSIENT_PARSE_RETRIES = 3
 
 
 @dataclass
@@ -115,9 +116,14 @@ class StreamingRefChannel:
         # producer-side
         self._published = 0
         # consumer-side
+        # Keep byte offsets so a failed tail read can be retried from the
+        # exact record boundary. Text-mode seek cookies cannot provide that
+        # guarantee on a shared filesystem.
         self._read_offset = 0
-        self._partial_line = ""
-        self._complete_lines = deque[str]()
+        self._partial_line = b""
+        self._partial_line_offset = 0
+        self._complete_lines: deque[tuple[int, bytes]] = deque()
+        self._parse_retries: dict[int, int] = {}
         self._consumed = 0
         # ``mark_consumed`` is called from both the trainer thread (batch acks)
         # and the prefetch worker (failure settlement), so the increment and
@@ -327,28 +333,60 @@ class StreamingRefChannel:
 
         Non-blocking: returns whatever is available now (possibly empty). A
         partially written trailing line is buffered until its newline arrives, so
-        a ref is never parsed half-written.
+        a ref is never parsed half-written. Some shared filesystems can expose
+        a transient stale or duplicated range while a file is being appended.
+        A malformed complete line is therefore retried from its byte boundary
+        before it is treated as persistent corruption.
         """
         try:
-            with open(self.path, "r") as f:
+            with open(self.path, "rb") as f:
                 f.seek(self._read_offset)
                 chunk = f.read()
-                self._read_offset = f.tell()
+                self._read_offset += len(chunk)
         except FileNotFoundError:
-            chunk = ""
+            chunk = b""
         if chunk:
-            lines = (self._partial_line + chunk).split("\n")
+            if self._partial_line:
+                line_offset = self._partial_line_offset
+                pending = self._partial_line + chunk
+            else:
+                line_offset = self._read_offset - len(chunk)
+                pending = chunk
+            lines = pending.split(b"\n")
             self._partial_line = lines.pop()
-            self._complete_lines.extend(lines)
+            for line in lines:
+                self._complete_lines.append((line_offset, line))
+                line_offset += len(line) + 1
+            self._partial_line_offset = line_offset
         # Parse queued lines even when no new bytes arrived -- a previous max_n
         # call may have left complete lines buffered.
         out: List[SampleRef] = []
         while self._complete_lines:
             if max_n is not None and len(out) >= max_n:
                 break
-            line = self._complete_lines.popleft().strip()
+            line_offset, raw_line = self._complete_lines.popleft()
+            line = raw_line.strip()
             if line:
-                out.append(ref_from_dict(json.loads(line)))
+                try:
+                    out.append(ref_from_dict(json.loads(line)))
+                except json.JSONDecodeError as exc:
+                    retries = self._parse_retries.get(line_offset, 0) + 1
+                    self._parse_retries[line_offset] = retries
+                    if retries > _MAX_TRANSIENT_PARSE_RETRIES:
+                        raise RuntimeError(
+                            f"StreamingRefChannel {self.path}: record at byte "
+                            f"offset {line_offset} remained invalid after "
+                            f"{_MAX_TRANSIENT_PARSE_RETRIES} retries"
+                        ) from exc
+                    # Do not consume subsequent records from the possibly stale
+                    # read. Re-read this record and every later byte next poll.
+                    self._read_offset = line_offset
+                    self._partial_line = b""
+                    self._partial_line_offset = line_offset
+                    self._complete_lines.clear()
+                    break
+                else:
+                    self._parse_retries.pop(line_offset, None)
         return out
 
     def mark_consumed(self, n: int) -> None:

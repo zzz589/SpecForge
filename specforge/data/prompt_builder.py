@@ -10,12 +10,50 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from itertools import islice
 from numbers import Integral
 from typing import Any, Callable
 
 PromptTaskDict = dict[str, Any]
+
+
+def _resolve_prompt_paths(path: str | os.PathLike[str]) -> list[str]:
+    """Resolve one JSONL file, a JSONL directory, or a line-oriented manifest."""
+    candidate = Path(path)
+    if candidate.is_dir():
+        paths = sorted(
+            entry
+            for entry in candidate.iterdir()
+            if entry.is_file() and entry.suffix == ".jsonl"
+        )
+    elif candidate.suffix == ".manifest":
+        paths = []
+        for line_number, line in enumerate(
+            candidate.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            resolved = Path(entry)
+            if not resolved.is_absolute():
+                resolved = candidate.parent / resolved
+            if not resolved.is_file():
+                raise FileNotFoundError(
+                    f"manifest entry {line_number} in {candidate!s} is not a file: "
+                    f"{resolved!s}"
+                )
+            paths.append(resolved)
+    else:
+        paths = [candidate]
+
+    if not paths:
+        raise ValueError(f"no JSONL prompt files found at {candidate!s}")
+    missing = [str(entry) for entry in paths if not entry.is_file()]
+    if missing:
+        raise FileNotFoundError(f"prompt data file does not exist: {missing[0]}")
+    return [str(entry) for entry in paths]
 
 
 def prepare_prompt_tasks(
@@ -56,7 +94,8 @@ def prepare_prompt_tasks(
         cache_key=cache_key,
         loss_mask_filter=loss_mask_filter,
     )
-    path_string = os.fspath(path)
+    path_strings = _resolve_prompt_paths(path)
+    path_string = path_strings[0]
     first_record = next(_iter_records(path_string), None)
     if first_record is None:
         return []
@@ -73,10 +112,14 @@ def prepare_prompt_tasks(
 
     limit = None if max_prompts in (None, 0) else max_prompts
     if has_input_ids:
-        rows = (
-            (record, f"{path_string}:{line_number}")
-            for line_number, record in _iter_records(path_string)
-        )
+        def iter_rows():
+            for prompt_path in path_strings:
+                yield from (
+                    (record, f"{prompt_path}:{line_number}")
+                    for line_number, record in _iter_records(prompt_path)
+                )
+
+        rows = iter_rows()
         if limit is not None:
             rows = islice(rows, limit)
         return _materialize_prompt_tasks(
@@ -86,6 +129,11 @@ def prepare_prompt_tasks(
             loss_mask_filter=loss_mask_filter,
         )
 
+    if len(path_strings) != 1:
+        raise ValueError(
+            "raw conversation manifests/directories are unsupported; map each "
+            "shard first and pass the resulting pre-tokenized manifest"
+        )
     return _prepare_raw_prompts(
         path_string,
         tokenizer,
