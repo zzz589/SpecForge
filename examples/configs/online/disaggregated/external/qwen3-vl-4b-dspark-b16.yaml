@@ -1,0 +1,59 @@
+model:
+  target_model_path: models/Qwen3-VL-4B-Instruct
+  target_backend: sglang
+  draft_model_config: configs/qwen3-4b-dspark-b16.json
+  draft_checkpoint_path: models/Qwen3-4B-DSpark-b16
+  input_modality: multimodal
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+data:
+  train_data_path: data/train_vl_regen.jsonl
+  max_length: 4096
+  chat_template: qwen
+  cache_dir: cache/qwen3-vl-4b-dspark-b16
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dspark
+  num_epochs: 3
+  batch_size: 1
+  accumulation_steps: 2
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  num_anchors: 32
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 2000
+  dist_timeout: 30
+  seed: 20261014
+
+tracking:
+  report_to: none
+
+run_id: qwen3-vl-4b-dspark-b16
+output_dir: outputs/qwen3-vl-4b-dspark-b16
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
+  disaggregated:
+    control_dir: outputs/qwen3-vl-4b-dspark-b16/control
+    consumer_state_dir: outputs/qwen3-vl-4b-dspark-b16/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp
+
+runtime:
+  producer_lease: 1
+  producer_concurrency: 1
