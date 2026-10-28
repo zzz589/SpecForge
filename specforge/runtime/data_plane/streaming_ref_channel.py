@@ -330,16 +330,23 @@ class StreamingRefChannel:
         a ref is never parsed half-written.
         """
         try:
-            with open(self.path, "r") as f:
+            with open(self.path, "rb") as f:
                 f.seek(self._read_offset)
                 chunk = f.read()
-                self._read_offset = f.tell()
         except FileNotFoundError:
-            chunk = ""
+            chunk = b""
         if chunk:
-            lines = (self._partial_line + chunk).split("\n")
-            self._partial_line = lines.pop()
-            self._complete_lines.extend(lines)
+            # Only advance past complete records.  If a producer is appending
+            # while we read, retain the incomplete suffix in the file and
+            # re-read it next poll instead of combining an in-memory fragment
+            # with a potentially ambiguous subsequent filesystem read.
+            last_newline = chunk.rfind(b"\n")
+            if last_newline >= 0:
+                complete = chunk[:last_newline].split(b"\n")
+                self._read_offset += last_newline + 1
+                self._complete_lines.extend(
+                    line.decode("utf-8") for line in complete
+                )
         # Parse queued lines even when no new bytes arrived -- a previous max_n
         # call may have left complete lines buffered.
         out: List[SampleRef] = []
