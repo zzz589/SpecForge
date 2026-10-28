@@ -1,6 +1,6 @@
 # Multimodal (image+text) DSpark on Qwen3.5-4B: disaggregated online training
-# against an external patched SGLang capture server. Requires sglang v0.5.14
-# with patches/sglang/v0.5.14/spec-capture.patch and
+# against an external patched SGLang capture server. Requires sglang v0.5.18
+# with patches/sglang/v0.5.18/spec-capture.patch and
 # SGLANG_MM_AVOID_RETOKENIZE=1 on the capture server. DSpark capture adds
 # target_last_hidden_states on top of the DFlash multimodal feature set.
 #

@@ -1,0 +1,8 @@
+FROM lmsysorg/sglang:v0.5.18-cu130@sha256:db37df8aded8fa169f7264404f3c893672f8046609a4a43d15bedcb4f63d692a
+WORKDIR /workspace/SpecForge
+COPY . .
+RUN python3 -m pip install --no-cache-dir -r requirements-lock.txt \
+ && python3 -m pip install --no-deps -e . \
+ && scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18
+ENV PYTHONUNBUFFERED=1
+CMD ["python3","scripts/verify_environment.py"]
