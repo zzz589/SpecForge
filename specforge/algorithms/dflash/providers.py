@@ -221,7 +221,7 @@ def algorithm_spec() -> AlgorithmSpec:
             FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="multimodal",
-                required_tensors=ready,
+                required_tensors=ready | {"position_ids"},
             ),
         ),
         capabilities=AlgorithmCapabilities(
@@ -300,6 +300,7 @@ def algorithm_providers() -> AlgorithmProviders:
                     passthrough=(
                         ("input_ids", "input_ids", ()),
                         ("loss_mask", "loss_mask", ()),
+                        ("position_ids", "position_ids", (3,)),
                     ),
                 ),
                 build_collator=collator,

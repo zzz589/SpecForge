@@ -414,6 +414,11 @@ class ModelConfig(StrictConfigModel):
 class DataConfig(StrictConfigModel):
     #: online mode — raw conversation JSON/JSONL.
     train_data_path: str = ""
+    #: Optional sharded Arrow manifest produced by the VLM dataset mapper.
+    #: Multimodal online capture reuses its token/loss-mask columns and reads
+    #: image bytes lazily from ``train_data_path`` instead of mapping again.
+    exact_journal_path: Optional[str] = None
+    mapped_manifest_path: Optional[str] = None
     #: online mode — already-tokenized JSONL records.
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
@@ -1131,6 +1136,12 @@ class Config(StrictConfigModel):
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
+        if self.data.exact_journal_path is not None and (
+            not self.data.exact_journal_path.strip() or self.mode != "online"
+            or self.model.input_modality != "multimodal" or self.data.mapped_manifest_path
+            or self.data.max_prompts not in (None, 0)
+        ):
+            raise ValueError("exact_journal_path requires complete online multimodal raw input")
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role

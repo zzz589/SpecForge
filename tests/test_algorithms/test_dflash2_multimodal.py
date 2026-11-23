@@ -9,6 +9,7 @@ from transformers import AutoConfig
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.contracts import FeatureMode
+from specforge.data.vlm_preprocessing import build_qwen3_vl_position_ids
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.dflash2 import DFlash2DraftModel
 
@@ -83,10 +84,35 @@ class DFlash2MultimodalCompositionTest(unittest.TestCase):
         )
         self.assertEqual(
             set(contract.required_tensors),
-            {"input_ids", "loss_mask", "hidden_states"},
+            {"input_ids", "loss_mask", "hidden_states", "position_ids"},
         )
         self.assertEqual(provider.capture_method, "dflash")
         self.assertIsNone(provider.layout.last_hidden_feature)
+        self.assertIn(
+            ("position_ids", "position_ids", (3,)), provider.layout.passthrough
+        )
+
+    def test_qwen3_vl_position_ids_use_the_merged_image_grid(self):
+        positions = build_qwen3_vl_position_ids(
+            [10, 11, 99, 99, 99, 99, 12],
+            image_pad_token_id=99,
+            image_grid_thw=[1, 4, 4],
+            merge_size=2,
+            source="test",
+        )
+
+        self.assertEqual(
+            positions,
+            [
+                [0, 0, 0],
+                [1, 1, 1],
+                [2, 2, 2],
+                [2, 2, 3],
+                [2, 3, 2],
+                [2, 3, 3],
+                [4, 4, 4],
+            ],
+        )
 
 
 if __name__ == "__main__":

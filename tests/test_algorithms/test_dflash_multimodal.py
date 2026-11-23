@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.vlm_input import VlmServerInputAdapter
 from specforge.algorithms.contracts import FeatureMode
-from specforge.data.vlm_preprocessing import _expand_image_region, _image_token_count
+from specforge.data.vlm_preprocessing import (
+    _MappedVlmPromptSequence,
+    _collapse_mapped_image_region,
+    _expand_image_region,
+    _image_token_count,
+)
 
 try:
     import torch
@@ -28,7 +33,7 @@ class MultimodalRegistrationTest(unittest.TestCase):
         )
         self.assertEqual(
             set(contract.required_tensors),
-            {"input_ids", "loss_mask", "hidden_states"},
+            {"input_ids", "loss_mask", "hidden_states", "position_ids"},
         )
         provider = registration.providers.server_streaming_for("multimodal")
         self.assertEqual(provider.capture_method, "dflash")
@@ -75,6 +80,53 @@ class VlmExpansionMathTest(unittest.TestCase):
             _expand_image_region(
                 [99, 10, 99], [0, 0, 0], pad_token_id=99, count=4, source="t"
             )
+
+    def test_collapse_mapped_image_region_keeps_one_request_placeholder(self):
+        ids, mask = _collapse_mapped_image_region(
+            [10, 99, 99, 99, 20],
+            [0, 0, 0, 0, 1],
+            pad_token_id=99,
+            has_image=True,
+            source="test",
+        )
+        self.assertEqual(ids, [10, 99, 20])
+        self.assertEqual(mask, [0, 0, 1])
+
+    def test_collapse_mapped_image_region_checks_the_image_contract(self):
+        with self.assertRaises(ValueError):
+            _collapse_mapped_image_region(
+                [10, 20],
+                [0, 1],
+                pad_token_id=99,
+                has_image=True,
+                source="test",
+            )
+
+
+class MappedVlmPromptSequenceTest(unittest.TestCase):
+    def test_sequence_reuses_cached_tokens_and_keeps_image_lazy(self):
+        dataset = [
+            {
+                "image_grid_thw": [[1, 2, 6]],
+                "input_ids": [[10, 99, 99, 99, 20]],
+                "loss_mask": [[0, 0, 0, 0, 1]],
+            }
+        ]
+        prompts = _MappedVlmPromptSequence(
+            dataset,
+            ["/tmp/image.jpg"],
+            pad_token_id=99,
+            max_length=16,
+            min_loss_tokens=1,
+            merge_size=2,
+        )
+        payload = prompts[0]["payload"]
+        self.assertEqual(payload["input_ids"], [10, 99, 99, 99, 20])
+        self.assertEqual(payload["loss_mask"], [0, 0, 0, 0, 1])
+        self.assertEqual(payload["request_input_ids"], [10, 99, 20])
+        self.assertEqual(payload["image_path"], "/tmp/image.jpg")
+        self.assertNotIn("image_data", payload)
+        self.assertEqual(payload["position_ids"], [[0,0,0],[1,1,1],[1,1,2],[1,1,3],[4,4,4]])
 
 
 class ExtractImageFieldTest(unittest.TestCase):
@@ -168,6 +220,23 @@ class VlmRequestInputsTest(unittest.TestCase):
         request = adapter.build_request_inputs(tasks)
         self.assertEqual(request["input_ids"], [[1, 2, 3], [7, 8]])
         self.assertEqual(request["image_data"], ["aGVsbG8=", None])
+
+    def test_build_request_inputs_loads_mapped_image_path_lazily(self):
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4"
+            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+        )
+        adapter = VlmServerInputAdapter(config=SimpleNamespace())
+        task = SimpleNamespace(
+            task_id="mapped-0",
+            payload={
+                "request_input_ids": [1, 99, 2],
+                "image_path": f"data:image/png;base64,{png_b64}",
+            },
+        )
+        request = adapter.build_request_inputs([task])
+        self.assertEqual(request["input_ids"], [[1, 99, 2]])
+        self.assertTrue(request["image_data"][0].startswith("data:image/png;base64,"))
 
 
 @unittest.skipUnless(TORCH_AVAILABLE, "requires torch")

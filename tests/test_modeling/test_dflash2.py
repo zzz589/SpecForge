@@ -10,7 +10,10 @@ from transformers import Qwen3Config
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.algorithms.dflash.providers import resume_contract
 from specforge.core.chunking import checkpointed_chunk_reduce
-from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
+from specforge.modeling.draft.dflash import (
+    Qwen3DFlashDecoderLayer,
+    Qwen3InterleavedMultiRotaryEmbedding,
+)
 from specforge.modeling.draft.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -49,6 +52,30 @@ def _tiny_config(**dflash_overrides):
 
 
 class DFlash2ArchitectureTest(unittest.TestCase):
+    def test_uses_qwen3_vl_interleaved_mrope_when_configured(self):
+        config = _tiny_config()
+        rope_theta = config.rope_parameters["rope_theta"]
+        config.rope_scaling = {
+            "rope_type": "default",
+            "rope_theta": rope_theta,
+            "mrope_interleaved": True,
+            "mrope_section": [1, 1, 0],
+        }
+        config.rope_parameters = config.rope_scaling
+        model = DFlash2DraftModel(config)
+        positions = torch.tensor(
+            [[[0, 1, 2]], [[0, 1, 3]], [[0, 2, 2]]], dtype=torch.long
+        )
+
+        cos, sin = model.rotary_emb(torch.zeros(1, 3, 16), positions)
+
+        self.assertTrue(model.use_interleaved_mrope)
+        self.assertIsInstance(
+            model.rotary_emb, Qwen3InterleavedMultiRotaryEmbedding
+        )
+        self.assertEqual(tuple(cos.shape), (1, 3, 4))
+        self.assertEqual(tuple(sin.shape), (1, 3, 4))
+
     def test_builds_sglang_compatible_modules_and_keys(self):
         model = DFlash2DraftModel(_tiny_config())
 

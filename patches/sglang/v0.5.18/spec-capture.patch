@@ -1416,3 +1416,49 @@ index 0000000..69c0c4a
 +
 +def get_sink() -> Optional[SpecCaptureSink]:
 +    return _SINK
+
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -1485,7 +1485,7 @@
+                 "DFLASH requires explicit layer_ids for aux hidden capture."
+             )
+         self.capture_aux_hidden_states = True
+-        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
++        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         stacked_params_mapping = [
+
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -1524,7 +1524,27 @@
+ 
+         """
+         assert images is not None
+-        image_sizes = [(image.height, image.width) for image in images]
++        image_sizes = []
++        for image in images:
++            if hasattr(image, "height") and hasattr(image, "width"):
++                image_sizes.append((image.height, image.width))
++                continue
++
++            # SGLang may decode data-URI images into uint8 tensors on the
++            # active device. Preserve pre-tokenized ids without re-tokenizing.
++            if isinstance(image, torch.Tensor):
++                if image.ndim == 3 and image.shape[0] in (1, 3, 4):
++                    image_sizes.append((int(image.shape[1]), int(image.shape[2])))
++                    continue
++                if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
++                    image_sizes.append((int(image.shape[0]), int(image.shape[1])))
++                    continue
++
++            raise TypeError(
++                "Unsupported image type for token counting: "
++                f"{type(image)!r}; expected a PIL image or a 3D image tensor"
++            )
++
+         num_image_tokens = self._processor._get_num_multimodal_tokens(
+             image_sizes=image_sizes
+         ).num_image_tokens

@@ -527,6 +527,11 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             "max_valid_anchors": max_valid_anchors,
             "selector_loss_alpha": selector_loss_alpha,
         }
+        position_ids = t.get("position_ids")
+        if position_ids is not None:
+            model_inputs["position_ids"] = position_ids.to(
+                device, non_blocking=True
+            )
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")

@@ -391,6 +391,39 @@ class OnlineDFlashModel(nn.Module):
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
+    def _create_position_ids_from_context(
+        self,
+        context_position_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Gather draft-block positions from text or Qwen3-VL context positions."""
+
+        offsets = torch.arange(
+            self.block_size, device=anchor_positions.device
+        ).view(1, 1, -1)
+        bsz, n_blocks = anchor_positions.shape
+        if context_position_ids.ndim == 2:
+            gather_indices = (
+                anchor_positions.unsqueeze(-1) + offsets
+            ).clamp(max=seq_len - 1)
+            gathered = torch.gather(
+                context_position_ids.unsqueeze(1).expand(-1, n_blocks, -1),
+                2,
+                gather_indices,
+            )
+            return gathered.reshape(bsz, -1)
+        if context_position_ids.ndim == 3 and context_position_ids.shape[0] == 3:
+            # Each proposal represents future text, including slots past the
+            # recorded response or into batch padding. Match decode positions.
+            anchor_ids = anchor_positions.unsqueeze(0).expand(3, -1, -1)
+            base = context_position_ids.gather(2, anchor_ids)
+            return (base.unsqueeze(-1) + offsets).reshape(3, bsz, -1)
+        raise ValueError(
+            "position_ids must have shape [B, S] or [3, B, S], got "
+            f"{tuple(context_position_ids.shape)}"
+        )
+
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
@@ -598,6 +631,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
@@ -614,11 +648,51 @@ class OnlineDFlashModel(nn.Module):
             input_ids, anchor_positions, block_keep_mask
         )
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        if position_ids is None:
+            if getattr(self.draft_model, "use_interleaved_mrope", False):
+                raise ValueError(
+                    "mRoPE draft training requires explicit position_ids; "
+                    "refusing to silently substitute one-dimensional positions."
+                )
+            context_position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            )
+        else:
+            context_position_ids = position_ids.to(device=device).long()
+            if getattr(self.draft_model, "use_interleaved_mrope", False) and (
+                context_position_ids.ndim != 3
+                or tuple(context_position_ids.shape) != (bsz, seq_len, 3)
+            ):
+                raise ValueError(
+                    "mRoPE draft training requires position_ids [B, S, 3], "
+                    f"got {tuple(context_position_ids.shape)}"
+                )
+            # Capture/collation stores one triplet per token as [B, S, 3].
+            # Require that contract here: inferring the axis from a dimension
+            # of size three is ambiguous when batch or sequence length is three.
+            if context_position_ids.ndim == 3:
+                if tuple(context_position_ids.shape) != (bsz, seq_len, 3):
+                    raise ValueError(
+                        "multimodal position_ids must have shape [B, S, 3], "
+                        f"got {tuple(context_position_ids.shape)}"
+                    )
+                context_position_ids = context_position_ids.permute(
+                    2, 0, 1
+                ).contiguous()
+                if not getattr(self.draft_model, "use_interleaved_mrope", False):
+                    context_position_ids = context_position_ids[0]
+            if context_position_ids.shape[-1] != seq_len:
+                raise ValueError(
+                    "position_ids length mismatch: "
+                    f"got {context_position_ids.shape[-1]}, expected {seq_len}"
+                )
+        draft_position_ids = self._create_position_ids_from_context(
+            context_position_ids, anchor_positions, seq_len
         )
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        concat_dim = 1 if context_position_ids.ndim == 2 else 2
+        full_position_ids = torch.cat(
+            [context_position_ids, draft_position_ids], dim=concat_dim
+        )
 
         mask_builder = (
             create_dflash_block_mask
@@ -1393,6 +1467,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
@@ -1412,6 +1487,7 @@ class OnlineDFlashModel(nn.Module):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            position_ids=position_ids,
             max_valid_anchors=max_valid_anchors,
         )
 

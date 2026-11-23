@@ -174,7 +174,7 @@ def build_collator():
     # carries it; offline v1 DFlash and Domino batches omit it.
     return _padded_collator(
         ("input_ids", "loss_mask", "hidden_states"),
-        optional_keys=("target_last_hidden_states",),
+        optional_keys=("target_last_hidden_states", "position_ids"),
     )
 
 

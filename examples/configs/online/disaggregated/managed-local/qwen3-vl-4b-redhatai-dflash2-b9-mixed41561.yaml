@@ -1,0 +1,108 @@
+# Qwen3-VL-4B target + public RedHatAI DFlash2 block-9 comparison run.
+# GPU 5 owns multimodal capture; GPUs 6-7 train with global batch 4.
+# Checkpoints use the DSpark cadence for matched learning-curve evaluation.
+model:
+  target_model_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/models/Qwen3-VL-4B-Instruct
+  # Losslessly converted from the public RedHatAI text DFlash2 checkpoint.
+  # It retains block_size=9, five draft layers, and selector_top_k=16.
+  draft_model_config: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments_results/qwen3-4b-redhatai-dflash2-specforge-b9-20261105/Qwen3-4B-speculator.dflash2-specforge-b9-v2
+  draft_checkpoint_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments_results/qwen3-4b-redhatai-dflash2-specforge-b9-20261105/Qwen3-4B-speculator.dflash2-specforge-b9-v2
+  target_backend: sglang
+  input_modality: multimodal
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_attention_backend: triton
+  sglang_disable_radix_cache: true
+  sglang_disable_cuda_graph: true
+  # data.max_length + request/capture headroom.
+  sglang_context_length: 4111
+  # The existing mapped cache was created with exactly these pixel bounds.
+  # Keeping capture preprocessing identical avoids a vision-token mismatch
+  # between mapped input_ids and the SGLang target request.
+  sglang_extra_args:
+    - --mm-process-config
+    - '{"image":{"min_pixels":50176,"max_pixels":802816}}'
+
+data:
+  train_data_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/data/mixed_llava_power/mixed_llava34000_power7561_seed20261014_pr785_dspark.jsonl
+  # Explicitly selecting the complete sharded manifest activates the mapped
+  # fast path.  It reuses input_ids/loss_mask, does not call Dataset.map, and
+  # opens/encodes an image only when that sample is leased for capture.
+  mapped_manifest_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/data/mixed_llava_power/mixed_llava34000_power7561_seed20261014.manifest.json
+  max_length: 4096
+  chat_template: qwen
+  # Retained for ordinary unmapped runs; ignored by the mapped fast path.
+  cache_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/qwen3-vl-4b-redhatai-dflash2-b9-mixed41561-compare-gbs4-20261106/cache
+  build_dataset_num_proc: 1
+  dataloader_num_workers: 8
+
+training:
+  # The common capture/optimization strategy is named dflash; the checkpoint
+  # architecture above selects DFlash2 and enables its conv/selector losses.
+  strategy: dflash
+  num_epochs: 3
+  batch_size: 1
+  # 2 trainer ranks x batch 1 x accumulation 2 = global batch 4, matching DSpark.
+  accumulation_steps: 2
+  fsdp_sharding: SHARD_GRAD_OP
+  learning_rate: 0.00001
+  # Match the completed DSpark 41k VL adaptation for coarse comparison.
+  # DFlash2-only selector settings remain below.
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  num_anchors: 32
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  loss_type: dflash
+  dflash_teacher_metrics: false
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_stop_gradient: false
+  save_interval: 2000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 20261014
+  prompt_seed: 20261014
+
+tracking:
+  report_to: none
+
+runtime:
+  # The validated Qwen3-VL capture path currently requires one logical VLM
+  # sample per /generate request to avoid SGLang's batched RID issue.
+  producer_lease: 1
+  producer_concurrency: 1
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-vl-4b-redhatai-dflash2-b9-mixed41561-compare-gbs4-20261106
+output_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/qwen3-vl-4b-redhatai-dflash2-b9-mixed41561-compare-gbs4-20261106/output
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
+  disaggregated:
+    control_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/qwen3-vl-4b-redhatai-dflash2-b9-mixed41561-compare-gbs4-20261106/control
+    consumer_state_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/qwen3-vl-4b-redhatai-dflash2-b9-mixed41561-compare-gbs4-20261106/consumer-state
+    backend: mooncake
+    client_buffer_size: 2147483648
+    managed_local:
+      trainer_cuda_visible_devices: ["6", "7"]
+      shutdown_grace_s: 30
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 68719476736
+        local_buffer_size_bytes: 2147483648
+        default_kv_lease_ttl_ms: 10000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["5"]
+          tp_size: 1
+          mem_fraction_static: 0.70
+          env:
+            SGLANG_ENABLE_JIT_DEEPGEMM: "0"

@@ -1,0 +1,93 @@
+# Foreign-object nested scale experiment using DFlash2-VL + D-PACE.
+# Every scale independently starts from the same public RedHatAI DFlash2 init
+# adapted to Qwen3-VL interleaved mRoPE.  Subsets are strict prefixes built
+# with seed 20261116: 1k ⊂ 2k ⊂ ... ⊂ 8k.
+model:
+  target_model_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/models/Qwen3-VL-4B-Instruct
+  draft_model_config: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments_results/qwen3-4b-redhatai-dflash2-specforge-b9-20261105/Qwen3-4B-speculator.dflash2-specforge-b9-qwen3vl-mrope-v1
+  draft_checkpoint_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments_results/qwen3-4b-redhatai-dflash2-specforge-b9-20261105/Qwen3-4B-speculator.dflash2-specforge-b9-qwen3vl-mrope-v1
+  target_backend: sglang
+  input_modality: multimodal
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_attention_backend: triton
+  sglang_disable_radix_cache: true
+  sglang_disable_cuda_graph: true
+  sglang_context_length: 4111
+
+data:
+  train_data_path: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/data/dflash2_scene_datasets/foreign_object_detection/processed-dflash2-v1/train-ready/subsets/foreign-object-qwen3vl4b-regen-train-1000.jsonl
+  max_length: 4096
+  chat_template: qwen
+  cache_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/foreign-object-dflash2-dpace-scale-20261116/n1000/cache
+  build_dataset_num_proc: 8
+  dataloader_num_workers: 4
+
+training:
+  strategy: dflash
+  num_epochs: 3
+  batch_size: 1
+  accumulation_steps: 2
+  fsdp_sharding: SHARD_GRAD_OP
+  learning_rate: 0.00001
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  num_anchors: 32
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 0.1
+  kl_decay: 0.0
+  dflash_teacher_metrics: false
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_stop_gradient: false
+  save_interval: 750
+  max_steps: 750
+  log_interval: 10
+  dist_timeout: 30
+  seed: 20261116
+  prompt_seed: 20261116
+
+tracking:
+  report_to: none
+
+runtime:
+  producer_lease: 1
+  producer_concurrency: 1
+  in_flight_high_watermark: 128
+  in_flight_low_watermark: 96
+
+run_id: qwen3-vl-4b-dflash2-dpace-foreign-object-n1000-e3-lr1e-5-20261116
+output_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/foreign-object-dflash2-dpace-scale-20261116/n1000/output
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
+  disaggregated:
+    control_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/foreign-object-dflash2-dpace-scale-20261116/n1000/control
+    consumer_state_dir: /HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/experiments/foreign-object-dflash2-dpace-scale-20261116/n1000/consumer-state
+    backend: mooncake
+    client_buffer_size: 2147483648
+    managed_local:
+      trainer_cuda_visible_devices: ["3", "4"]
+      shutdown_grace_s: 30
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 68719476736
+        local_buffer_size_bytes: 2147483648
+        default_kv_lease_ttl_ms: 10000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.70
+          env:
+            SGLANG_ENABLE_JIT_DEEPGEMM: "0"
