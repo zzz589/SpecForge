@@ -491,6 +491,7 @@ class OfflineDataProvider:
     build_normalizer: Factory
     build_collator: Factory
     capture_layout: OfflineCaptureLayout | None = None
+    prepare_data: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
@@ -500,6 +501,8 @@ class OfflineDataProvider:
             OfflineCaptureLayout,
         ):
             raise TypeError("capture_layout must be an OfflineCaptureLayout or None")
+        if self.prepare_data is not None and not callable(self.prepare_data):
+            raise TypeError("prepare_data must be callable or None")
         _factories_are_callable(
             (
                 ("build_reader", self.build_reader),

@@ -35,6 +35,7 @@ from specforge.algorithms.contracts import (
     OfflineStorageContract,
 )
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
+from specforge.algorithms.dflash.offline_data import prepare_offline_data
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
@@ -51,7 +52,12 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+    from specforge.modeling.draft.dflash_config import dflash_compute_config
+
+    contract = {
+        "dspark_compute_config": dflash_compute_config(draft_model.config),
+        "dspark_objective_normalization": "global_weighted_tokens_per_optimizer_step_v1",
+        "dspark_generation_mask": "first_eos_in_supervised_run_v1",
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -67,17 +73,42 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    if getattr(draft_model, "use_interleaved_mrope", False):
+        from specforge.modeling.draft.dflash import get_rope_scaling_value
+
+        contract["dspark_position_convention"] = "qwen3_vl_triplets_next_token_anchor_continuation_v1"
+        contract["dspark_mrope_section"] = tuple(get_rope_scaling_value(draft_model.config, "mrope_section"))
+        contract["dspark_mrope_theta"] = get_rope_scaling_value(
+            draft_model.config, "rope_theta", getattr(draft_model.config, "rope_theta", None)
+        )
+    return contract
 
 
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    if config.model.input_modality == "multimodal":
+        from specforge.modeling.draft.dflash import get_rope_scaling_value
+
+        if get_rope_scaling_value(draft_config, "mrope_interleaved", False) is not True:
+            raise ValueError("DSpark-VL requires an explicit mRoPE draft config; use configs/qwen3-vl-4b-dspark-mrope.json")
     return build_registered_draft(config, draft_config)
 
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
     from specforge.algorithms.model_providers import build_dspark_model
 
+    from specforge.modeling.target.target_utils import target_text_config
+
+    if getattr(draft_model.config, "eos_token_id", None) is None:
+        draft_model.config.eos_token_id = getattr(target_text_config(target_config), "eos_token_id", None)
+        if draft_model.config.eos_token_id is None:
+            draft_model.config.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if config.model.input_modality == "multimodal":
+        if getattr(target_config, "model_type", None) != "qwen3_vl":
+            raise ValueError("DSpark-VL mRoPE supports Qwen3-VL still images only")
+        if not getattr(draft_model, "use_interleaved_mrope", False):
+            raise ValueError("DSpark-VL requires an mRoPE-enabled draft")
     return build_dspark_model(
         config,
         draft_model,
@@ -141,7 +172,7 @@ def algorithm_spec() -> AlgorithmSpec:
             FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="multimodal",
-                required_tensors=ready,
+                required_tensors=ready | {"position_ids"},
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
@@ -190,6 +221,7 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_reader=partial(build_dspark_offline_reader, ALGORITHM_NAME),
+                prepare_data=prepare_offline_data,
                 build_normalizer=build_dspark_offline_normalizer,
                 build_collator=build_dspark_collator,
             ),
@@ -219,6 +251,7 @@ def algorithm_providers() -> AlgorithmProviders:
                     passthrough=(
                         ("input_ids", "input_ids", ()),
                         ("loss_mask", "loss_mask", ()),
+                        ("position_ids", "position_ids", (3,)),
                     ),
                 ),
                 build_collator=build_dspark_collator,

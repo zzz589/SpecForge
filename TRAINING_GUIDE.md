@@ -319,3 +319,5 @@ $EXP/output/${RUN_TAG}-step50/training_state.pt
 实跑验收结果：`prepared=100`、`skipped=0`、`committed=100`、`acked=100`、`global_step=50`，日志无 `Traceback`、`FAILED` 或 `RuntimeError`。训练完成后端口 30000、35551、35880、35903 均由 supervisor 自动释放。
 
 
+
+单轮单图的 DFlash2、DFlash、DSpark 训练与重生成，请查看[已验证的迁移指南](examples/qwen3_vl_single_image/README.md)。

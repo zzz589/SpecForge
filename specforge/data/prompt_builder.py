@@ -31,6 +31,7 @@ def prepare_prompt_tasks(
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None = None,
+    generation_eos_token_id=None,
 ) -> Sequence[PromptTaskDict]:
     """Prepare runtime prompt dictionaries from a JSONL file.
 
@@ -80,6 +81,7 @@ def prepare_prompt_tasks(
             min_loss_tokens=min_loss_tokens,
             limit=limit,
             loss_mask_filter=loss_mask_filter,
+            generation_eos_token_id=generation_eos_token_id,
         )
 
     return _prepare_raw_prompts(
@@ -94,7 +96,8 @@ def prepare_prompt_tasks(
         num_proc=num_proc,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
-        loss_mask_filter=None,
+        loss_mask_filter=loss_mask_filter,
+        generation_eos_token_id=generation_eos_token_id,
     )
 
 
@@ -112,6 +115,7 @@ def _prepare_raw_prompts(
     min_loss_tokens: int,
     limit: int | None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+    generation_eos_token_id=None,
 ) -> Sequence[PromptTaskDict]:
     try:
         from datasets import load_dataset
@@ -123,7 +127,7 @@ def _prepare_raw_prompts(
     from .preprocessing import build_eagle3_dataset
 
     dataset = load_dataset("json", data_files=path, split="train")
-    if loss_mask_filter is None and limit is not None and limit < len(dataset):
+    if generation_eos_token_id is None and loss_mask_filter is None and limit is not None and limit < len(dataset):
         dataset = dataset.select(range(limit))
 
     processed_dataset = build_eagle3_dataset(
@@ -139,11 +143,26 @@ def _prepare_raw_prompts(
         minimum_valid_tokens=min_loss_tokens,
         loss_mask_filter=loss_mask_filter,
     )
+    if generation_eos_token_id is not None:
+        def eligible_generation(example):
+            return _prompt_from_record(
+                example, source="processed dataset", max_length=max_length,
+                min_loss_tokens=min_loss_tokens,
+                generation_eos_token_id=generation_eos_token_id,
+            ) is not None
+
+        processed_dataset = processed_dataset.filter(
+            eligible_generation, num_proc=num_proc,
+            desc="Filtering DFlash generation anchors",
+        )
+    if limit is not None and limit < len(processed_dataset):
+        processed_dataset = processed_dataset.select(range(limit))
     return _ProcessedPromptSequence(
         processed_dataset,
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
         loss_mask_filter=loss_mask_filter,
+        generation_eos_token_id=generation_eos_token_id,
     )
 
 
@@ -157,11 +176,13 @@ class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
         max_length: int,
         min_loss_tokens: int,
         loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+        generation_eos_token_id=None,
     ) -> None:
         self._dataset = dataset
         self._max_length = max_length
         self._min_loss_tokens = min_loss_tokens
         self._loss_mask_filter = loss_mask_filter
+        self._generation_eos_token_id = generation_eos_token_id
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -179,6 +200,7 @@ class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
             source=f"processed dataset row {index}",
             max_length=self._max_length,
             min_loss_tokens=self._min_loss_tokens,
+            generation_eos_token_id=self._generation_eos_token_id,
         )
         if prompt is None:
             raise ValueError(
@@ -195,6 +217,7 @@ def _materialize_prompt_tasks(
     min_loss_tokens: int,
     limit: int | None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+    generation_eos_token_id=None,
 ) -> list[PromptTaskDict]:
     prompts: list[PromptTaskDict] = []
     for record, source in rows:
@@ -203,6 +226,7 @@ def _materialize_prompt_tasks(
             source=source,
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
+            generation_eos_token_id=generation_eos_token_id,
         )
         if prompt is None:
             continue
@@ -222,6 +246,7 @@ def _prompt_from_record(
     source: str,
     max_length: int,
     min_loss_tokens: int,
+    generation_eos_token_id=None,
 ) -> PromptTaskDict | None:
     if "input_ids" not in record or "loss_mask" not in record:
         raise ValueError(f"{source} must contain both input_ids and loss_mask")
@@ -242,6 +267,12 @@ def _prompt_from_record(
 
     input_ids = input_ids[:max_length]
     loss_mask = loss_mask[:max_length]
+    if generation_eos_token_id is not None:
+        from .loss_mask import trim_loss_mask_after_eos, has_consecutive_supervised_tokens
+
+        loss_mask = trim_loss_mask_after_eos(input_ids, loss_mask, generation_eos_token_id)
+        if not has_consecutive_supervised_tokens(loss_mask):
+            return None
     if sum(loss_mask) < min_loss_tokens:
         return None
     return {

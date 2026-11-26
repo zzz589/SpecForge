@@ -67,10 +67,12 @@ class VlmServerInputAdapter:
         input_tools: Any,
         *,
         draft_config: Any,
-    ) -> list[dict[str, Any]]:
+    ) -> Sequence[dict[str, Any]]:
         from transformers import AutoProcessor
 
-        from specforge.data.vlm_preprocessing import build_vlm_prompt_payloads
+        from specforge.data.vlm_preprocessing import (
+            build_vlm_prompt_payloads, build_mapped_vlm_prompt_payloads,
+        )
 
         minimum_loss_tokens = self._minimum_loss_tokens
         if minimum_loss_tokens is None:
@@ -87,9 +89,34 @@ class VlmServerInputAdapter:
             cache_dir=config.model.cache_dir,
             trust_remote_code=config.model.trust_remote_code,
         )
+        generation_eos_token_id = None
+        if getattr(getattr(config, "training", None), "strategy", None) in {"dflash", "dspark"}:
+            from transformers import AutoConfig
+
+            target_config = AutoConfig.from_pretrained(
+                config.model.target_model_path,
+                cache_dir=config.model.cache_dir,
+                trust_remote_code=config.model.trust_remote_code,
+            )
+            if target_config.model_type != "qwen3_vl":
+                raise ValueError("DFlash/DSpark-VL mRoPE positions currently support Qwen3-VL still images only")
+            generation_eos_token_id = getattr(draft_config, "eos_token_id", None)
+            if generation_eos_token_id is None:
+                generation_eos_token_id = tokenizer.eos_token_id
         path = config.data.prompts_path or config.data.train_data_path
         if not path:
             raise ValueError("multimodal prompt preparation requires a data path")
+        if getattr(config.data, "mapped_manifest_path", None):
+            return build_mapped_vlm_prompt_payloads(
+                path, config.data.mapped_manifest_path, tokenizer,
+                target_model_path=config.model.target_model_path,
+                chat_template=config.data.chat_template,
+                max_length=config.data.max_length,
+                min_loss_tokens=minimum_loss_tokens(config, draft_config),
+                max_prompts=config.data.max_prompts,
+                generation_eos_token_id=generation_eos_token_id,
+                processor=processor,
+            )
         return build_vlm_prompt_payloads(
             path,
             tokenizer,
@@ -98,6 +125,8 @@ class VlmServerInputAdapter:
             max_length=config.data.max_length,
             min_loss_tokens=minimum_loss_tokens(config, draft_config),
             max_prompts=config.data.max_prompts,
+            generation_eos_token_id=generation_eos_token_id,
+            exact_journal_path=getattr(config.data, "exact_journal_path", None),
         )
 
     def build_request_inputs(

@@ -516,17 +516,32 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         selector_loss_alpha = self._selector_loss_alpha(ctx)
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        from specforge.data.loss_mask import trim_loss_mask_after_eos
+
+        model = self.dflash_model
+        if not hasattr(model, "draft_model"):
+            model = getattr(model, "module", model)
+        draft_config = getattr(getattr(model, "draft_model", None), "config", None)
+        loss_mask = trim_loss_mask_after_eos(
+            t["input_ids"], t["loss_mask"], getattr(draft_config, "eos_token_id", None)
+        )
+        max_valid_anchors = _cpu_max_valid_anchors(loss_mask)
+        # A legacy batch may leave this rank empty while other ranks have labels.
+        # Keep a masked block in autograd so every rank reaches the collective.
+        if max_valid_anchors == 0 and loss_mask.shape[-1] > 1:
+            max_valid_anchors = 1
         collect_detailed_metrics = (
             ctx.collect_detailed_metrics if ctx is not None else True
         )
         model_inputs = {
             "input_ids": t["input_ids"].to(device, non_blocking=True),
             "hidden_states": t["hidden_states"].to(device, non_blocking=True),
-            "loss_mask": t["loss_mask"].to(device, non_blocking=True),
+            "loss_mask": loss_mask.to(device, non_blocking=True),
             "max_valid_anchors": max_valid_anchors,
             "selector_loss_alpha": selector_loss_alpha,
         }
+        if "position_ids" in t:
+            model_inputs["position_ids"] = t["position_ids"].to(device, non_blocking=True)
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")
@@ -590,15 +605,28 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        from specforge.data.loss_mask import trim_loss_mask_after_eos
+
+        model = self.dspark_model
+        if not hasattr(model, "draft_model"):
+            model = getattr(model, "module", model)
+        config = getattr(getattr(model, "draft_model", None), "config", None)
+        loss_mask = trim_loss_mask_after_eos(t["input_ids"], t["loss_mask"], getattr(config, "eos_token_id", None))
+        max_valid_anchors = _cpu_max_valid_anchors(loss_mask)
+        if max_valid_anchors == 0 and loss_mask.shape[-1] > 1:
+            max_valid_anchors = 1
+        position_kwargs = {}
+        if "position_ids" in t:
+            position_kwargs["position_ids"] = t["position_ids"].to(device, non_blocking=True)
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
+            loss_mask=loss_mask.to(device, non_blocking=True),
             target_last_hidden_states=t["target_last_hidden_states"].to(
                 device, non_blocking=True
             ),
             max_valid_anchors=max_valid_anchors,
+            **position_kwargs,
             collect_detailed_metrics=(
                 ctx.collect_detailed_metrics if ctx is not None else True
             ),
@@ -620,6 +648,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             loss=loss,
             metrics=metrics,
             ratio_metrics=ratio_metrics,
+            loss_terms=model_metrics.get("loss_terms"),
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

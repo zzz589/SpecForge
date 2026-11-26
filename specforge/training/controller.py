@@ -427,30 +427,31 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        loss = out.loss
-        ratio_metrics = dict(out.ratio_metrics)
-        if out.loss_terms is not None:
-            numerator, denominator = out.loss_terms
-            if numerator.numel() != 1 or denominator.numel() != 1:
-                raise ValueError("loss_terms must contain scalar tensors")
-            loss = numerator.reshape(())
-            denominator = denominator.detach().reshape(())
-            ratio_metrics["loss"] = (
-                numerator.detach().reshape(()),
-                denominator,
-            )
-        self._accumulate_ratio_metrics(ratio_metrics)
-        for name, value in out.sum_metrics.items():
-            self._sum_totals[name] = (
-                self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
-            )
-        loss = loss / self.accumulation_steps
+        from contextlib import nullcontext
+        stepped = (self._micro + 1) % self.accumulation_steps == 0
+        context = getattr(self.backend, "accumulation_context", None)
+        with context(is_boundary=stepped) if context else nullcontext():
+            out: StepOutput = self.strategy.forward_loss(batch, ctx)
+            loss = out.loss
+            ratio_metrics = dict(out.ratio_metrics)
+            if out.loss_terms is not None:
+                numerator, denominator = out.loss_terms
+                if numerator.numel() != 1 or denominator.numel() != 1:
+                    raise ValueError("loss_terms must contain scalar tensors")
+                loss = numerator.reshape(())
+                denominator = denominator.detach().reshape(())
+                ratio_metrics["loss"] = (
+                    numerator.detach().reshape(()),
+                    denominator,
+                )
+            self._accumulate_ratio_metrics(ratio_metrics)
+            for name, value in out.sum_metrics.items():
+                self._sum_totals[name] = (
+                    self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
+                )
+            loss = loss / self.accumulation_steps
+            self.backend.backward(loss, is_boundary=stepped)
         self._micro += 1
-        # The boundary is known before backward so the backend can defer the FSDP
-        # gradient reduction (no_sync) on non-boundary micro-steps.
-        stepped = self._micro % self.accumulation_steps == 0
-        self.backend.backward(loss, is_boundary=stepped)
         grad_norm = None
         if stepped:
             loss_denominator = None

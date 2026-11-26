@@ -1,0 +1,25 @@
+{
+  "target": "Qwen3-VL-4B-Instruct",
+  "examples": 3,
+  "regenerated_jsonl_sha256": "cce21b9cc7c3ddd8621bce20b0ec2406dc624d641186d3ae1190225a3f82edff",
+  "training_gpus": 1,
+  "capture_gpus": 1,
+  "runs": {
+    "dflash2": {
+      "steps": 2,
+      "serving_architecture": "DFlash2DraftModel",
+      "completion_tokens": 24
+    },
+    "dflash": {
+      "steps": 2,
+      "serving_architecture": "DFlashDraftModel",
+      "completion_tokens": 24
+    },
+    "dspark": {
+      "steps": 2,
+      "serving_architecture": "Qwen3DSparkModel",
+      "completion_tokens": 24
+    }
+  },
+  "environment": "existing hn47 CUDA environment; no clean install claimed"
+}

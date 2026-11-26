@@ -241,6 +241,13 @@ def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle
     return indices[dp_rank:total_size:dp_size]
 
 
+def _prepare_offline_data(provider, refs, *, store, model, max_len, normalizer):
+    prepare = getattr(provider, "prepare_data", None)
+    if prepare is None:
+        return refs, normalizer
+    return prepare(refs, store=store, model=model, max_len=max_len, normalizer=normalizer)
+
+
 def _make_offline_eval_data_factory(
     *,
     algorithm: AlgorithmRegistration,
@@ -252,6 +259,7 @@ def _make_offline_eval_data_factory(
     ttt_length: int,
     use_usp_preprocess: bool,
     dataloader_num_workers: int,
+    draft_model=None,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
     provider = algorithm.providers.offline_for(modality)
@@ -269,10 +277,14 @@ def _make_offline_eval_data_factory(
         ttt_length=ttt_length,
         max_len=max_len,
     ).read()
+    store = LocalFeatureStore(eval_run_id)
+    refs, per_sample_transform = _prepare_offline_data(
+        provider, refs, store=store, model=draft_model, max_len=max_len,
+        normalizer=per_sample_transform,
+    )
     refs = _shard_offline_refs(
         refs, use_usp_preprocess=use_usp_preprocess, shuffle=False
     )
-    store = LocalFeatureStore(eval_run_id)
 
     def build_loader():
         return FeatureDataLoader(
@@ -595,6 +607,11 @@ def build_offline_runtime(
     source_refs = provider.build_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
+    store = LocalFeatureStore(run_id)
+    source_refs, per_sample_transform = _prepare_offline_data(
+        provider, source_refs, store=store, model=draft_model, max_len=max_len,
+        normalizer=per_sample_transform,
+    )
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -605,7 +622,6 @@ def build_offline_runtime(
         )
 
     refs = refs_for_epoch(0)
-    store = LocalFeatureStore(run_id)
     if eval_hidden_states_path:
         if eval_data_factory is not None:
             raise ValueError(
@@ -615,6 +631,7 @@ def build_offline_runtime(
             algorithm=algorithm,
             modality=modality,
             hidden_states_path=eval_hidden_states_path,
+            draft_model=draft_model,
             run_id=run_id,
             batch_size=batch_size,
             max_len=max_len,
@@ -712,7 +729,10 @@ def build_disagg_offline_runtime(
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
     )
-    source_refs = list(refs)
+    source_refs, per_sample_transform = _prepare_offline_data(
+        algorithm.providers.offline_for(modality), list(refs), store=feature_store,
+        model=draft_model, max_len=max_len, normalizer=per_sample_transform,
+    )
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -737,6 +757,7 @@ def build_disagg_offline_runtime(
             algorithm=algorithm,
             modality=modality,
             hidden_states_path=eval_hidden_states_path,
+            draft_model=draft_model,
             run_id=run_id,
             batch_size=batch_size,
             max_len=max_len,

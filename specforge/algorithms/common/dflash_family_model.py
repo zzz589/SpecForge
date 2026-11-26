@@ -43,6 +43,10 @@ _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 _FUSED_UNARY_HEAD_ENV = "SPECFORGE_DFLASH_FUSED_HEAD"
 
 
+def _dspark_fused_device(logits: torch.Tensor) -> bool:
+    return logits.device.type != "cpu"
+
+
 def _triton_available() -> bool:
     try:
         import triton  # noqa: F401
@@ -341,6 +345,13 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _generation_loss_mask(self, input_ids, loss_mask):
+        """Keep EOS as a label, but trim the remainder of its supervised run."""
+        from specforge.data.loss_mask import trim_loss_mask_after_eos
+
+        eos = getattr(getattr(self.draft_model, "config", None), "eos_token_id", None)
+        return trim_loss_mask_after_eos(input_ids, loss_mask, eos)
+
     def _sample_anchor_positions(
         self,
         seq_len: int,
@@ -599,6 +610,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -614,11 +626,24 @@ class OnlineDFlashModel(nn.Module):
             input_ids, anchor_positions, block_keep_mask
         )
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        if position_ids is None:
+            if getattr(self.draft_model, "use_interleaved_mrope", False):
+                raise ValueError("mRoPE training requires explicit int64 position_ids [B, S, 3]")
+            context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            draft_position_ids = self._create_position_ids(anchor_positions)
+            full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        else:
+            if not getattr(self.draft_model, "use_interleaved_mrope", False):
+                raise ValueError("three-axis positions require an mRoPE-enabled draft")
+            if tuple(position_ids.shape) != (bsz, seq_len, 3) or position_ids.dtype != torch.int64:
+                raise ValueError("position_ids must be int64 [B, S, 3]; alternate axis layouts are not accepted")
+            context_position_ids = position_ids.to(device=device).permute(2, 0, 1).contiguous()
+            # All candidates are future text: advance each axis from the anchor.
+            # Never clamp tail slots to the final/padded context token.
+            anchor_ids = context_position_ids.gather(2, anchor_positions.unsqueeze(0).expand(3, -1, -1))
+            offsets = torch.arange(self.block_size, device=device)
+            draft_position_ids = (anchor_ids.unsqueeze(-1) + offsets).flatten(2)
+            full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=2)
 
         mask_builder = (
             create_dflash_block_mask
@@ -1397,6 +1422,7 @@ class OnlineDFlashModel(nn.Module):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) - same shape as Domino's forward.
@@ -1408,11 +1434,13 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
+        loss_mask = self._generation_loss_mask(input_ids, loss_mask)
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            position_ids=position_ids,
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -1445,7 +1473,10 @@ class OnlineDFlashModel(nn.Module):
             2,
             safe_label_indices,
         )
-        weight_mask = weight_mask * original_loss_mask_gathered
+        # A block predicts one contiguous response, never a later assistant turn.
+        contiguous = ((original_loss_mask_gathered > 0.5) & valid_label_mask)
+        contiguous = contiguous.to(weight_mask.dtype).cumprod(dim=-1)
+        weight_mask = weight_mask * original_loss_mask_gathered * contiguous
 
         hidden_4d = output_hidden.reshape(
             bsz,
@@ -2048,6 +2079,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        confidence_head = getattr(self.draft_model, "confidence_head", None)
+        if self.dspark_confidence_head_alpha == 0 and isinstance(
+            confidence_head, nn.Module
+        ):
+            # A statically disabled objective must not leave trainable parameters
+            # that DDP expects to reduce but that never participate in the loss.
+            confidence_head.requires_grad_(False)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2172,7 +2210,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 ).reshape_as(draft_logits)
                 teacher_ids = target_logits.argmax(dim=-1)
             # BF16 benefits from fusion; FP32 stays eager unless explicitly enabled.
-            if (
+            if _dspark_fused_device(draft_logits) and (
                 os.environ.get(
                     "SPECFORGE_DSPARK_FUSED_LOSS",
                     "1" if draft_logits.dtype == torch.bfloat16 else "0",
@@ -2202,9 +2240,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
-        confidence_pred = self.draft_model.predict_confidence(
-            hidden,
-            prev_token_ids=prev_token_ids,
+        confidence_pred = (
+            self.draft_model.predict_confidence(hidden, prev_token_ids=prev_token_ids)
+            if self.dspark_confidence_head_alpha > 0
+            else None
         )
         if confidence_pred is not None and self.dspark_confidence_head_alpha > 0:
             if accept_probability is None:
@@ -2352,29 +2391,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
             walk_accepted,
         ) = totals
 
-        global_loss_den = local_loss_den.detach().clone()
-        world_size = 1
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            world_size = dist.get_world_size()
-            if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-        # Device-side assert: a host-side float() here drains the stream per
-        # microbatch right after a collective, serializing all ranks.
-        torch._assert_async(
-            (global_loss_den > 0).any(),
-            "DSpark objective has no supervised target tokens",
+        # TrainerCore pools these terms over microbatches and the DP group.
+        # A locally empty rank must still participate in backward/collectives.
+        loss_num = (
+            self.dspark_ce_loss_alpha * ce_num
+            + self.dspark_l1_loss_alpha * l1_num
+            + self.dspark_confidence_head_alpha * confidence_num
         )
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
-            )
-            / global_loss_den
-        )
+        loss = loss_num / local_loss_den.clamp_min(torch.finfo(local_loss_den.dtype).tiny)
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -2412,6 +2436,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 for name, (numerator, denominator) in ratio_metrics.items()
             },
             "accuracy_denom": eval_den.detach(),
+            "loss_terms": (loss_num, local_loss_den.detach()),
         }
         accuracy = correct_num / eval_den.clamp_min(1.0)
         return loss, {"accuracy": accuracy.detach(), **metrics}
@@ -2424,17 +2449,20 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
+        loss_mask = self._generation_loss_mask(input_ids, loss_mask)
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            position_ids=position_ids,
         )
 
         (

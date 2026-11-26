@@ -62,7 +62,8 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
     if (
         rope_parameters
         and not rope_scaling
-        and rope_kind(rope_parameters) not in (None, "default")
+        and (rope_kind(rope_parameters) not in (None, "default")
+             or "mrope_section" in rope_parameters)
     ):
         config["rope_scaling"] = {
             key: value for key, value in rope_parameters.items() if key != "rope_theta"
@@ -71,7 +72,8 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
     elif (
         rope_scaling
         and not rope_parameters
-        and rope_kind(rope_scaling) not in (None, "default")
+        and (rope_kind(rope_scaling) not in (None, "default")
+             or "mrope_section" in rope_scaling)
     ):
         mirrored = dict(rope_scaling)
         if "rope_theta" in config:
@@ -177,6 +179,39 @@ def materialize_draft(
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
     torch_dtype = checkpoint_dtype(state["draft_state_dict"]) or torch.bfloat16
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch_dtype)
+    if hasattr(model, "use_interleaved_mrope"):
+        from specforge.modeling.draft.dflash_config import validate_dflash_compute_config
+
+        prefix = "dspark" if getattr(model, "expected_projector_type", None) == "dspark" else "dflash"
+        validate_dflash_compute_config(state, draft_config, config_path=draft_config_path, algorithm=prefix)
+        from specforge.modeling.draft.dflash import get_rope_scaling_value
+        convention = state.get(f"{prefix}_position_convention")
+        expected = ("qwen3_vl_triplets_next_token_anchor_continuation_v1" if prefix == "dspark"
+                    else "qwen3_vl_triplets_anchor_continuation_v1")
+        if model.use_interleaved_mrope:
+            if convention != expected:
+                raise ValueError("mRoPE export requires checkpoint position provenance")
+            for key, value in {
+                f"{prefix}_mrope_section": tuple(get_rope_scaling_value(draft_config, "mrope_section")),
+                f"{prefix}_mrope_theta": get_rope_scaling_value(draft_config, "rope_theta", getattr(draft_config, "rope_theta", None)),
+            }.items():
+                recorded = state.get(key)
+                if key.endswith("section") and recorded is not None:
+                    recorded = tuple(recorded)
+                if recorded != value:
+                    raise ValueError(f"checkpoint/config mismatch: {key}")
+        elif convention is not None or f"{prefix}_mrope_section" in state:
+            raise ValueError("cannot export an mRoPE checkpoint with a 1D RoPE config")
+        for key, value in {
+            f"{prefix}_block_size": model.block_size,
+            f"{prefix}_target_layer_ids": tuple(model.target_layer_ids),
+            f"{prefix}_mask_token_id": model.mask_token_id,
+        }.items():
+            recorded = state.get(key)
+            if key.endswith("layer_ids") and recorded is not None:
+                recorded = tuple(recorded)
+            if key in state and recorded != value:
+                raise ValueError(f"checkpoint/config mismatch: {key}")
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:
         raise ValueError(

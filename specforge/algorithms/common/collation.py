@@ -66,6 +66,12 @@ def pad_and_concatenate_features(
         for feature in features:
             tensor = feature[key]
             length = int(tensor.shape[axis])
+            if key == "position_ids":
+                expected = (feature["input_ids"].shape[0], feature["input_ids"].shape[1], 3)
+                if tuple(tensor.shape) != expected or tensor.dtype != torch.int64:
+                    raise ValueError("position_ids must be int64 [B, S, 3] aligned with input_ids")
+            if length != feature["input_ids"].shape[-1]:
+                raise ValueError(f"feature {key!r} does not align with its own input_ids")
             if length > max_length:
                 raise ValueError(
                     f"feature {key!r} sequence length {length} exceeds "

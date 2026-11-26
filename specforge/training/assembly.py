@@ -405,6 +405,11 @@ def _prepare_prompts(
             else _prompt_cache_key(cfg, tokenizer=tokenizer, path=source_path)
         )
     min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
+    generation_eos_token_id = None
+    if algorithm.name in {"dflash", "dspark"}:
+        generation_eos_token_id = getattr(draft_config, "eos_token_id", None)
+        if generation_eos_token_id is None:
+            generation_eos_token_id = getattr(tokenizer, "eos_token_id", None)
     return prepare_prompt_tasks(
         source_path,
         tokenizer,
@@ -418,6 +423,7 @@ def _prepare_prompts(
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
         loss_mask_filter=algorithm.providers.model.loss_mask_filter,
+        generation_eos_token_id=generation_eos_token_id,
     )
 
 

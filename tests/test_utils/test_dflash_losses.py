@@ -1051,7 +1051,7 @@ class TestDSparkFusedLoss(unittest.TestCase):
             target_last_hidden_states=torch.zeros_like(self.hidden_states),
         )
 
-    def test_fused_selection_defaults_to_bf16_and_honors_overrides(self):
+    def test_cpu_never_dispatches_fused_loss(self):
         def eager_tv(logits, targets):
             return 0.5 * (
                 logits.float().softmax(-1) - targets.float().softmax(-1)
@@ -1080,10 +1080,7 @@ class TestDSparkFusedLoss(unittest.TestCase):
                         if env_value is not None:
                             os.environ["SPECFORGE_DSPARK_FUSED_LOSS"] = env_value
                         loss, accuracy, _ = self._forward_with_target(model)
-                    expected = env_value == "1" or (
-                        env_value is None and dtype == torch.bfloat16
-                    )
-                    self.assertEqual(fused_call.called, expected)
+                    fused_call.assert_not_called()
                     self.assertTrue(torch.isfinite(loss))
                     self.assertTrue(torch.isfinite(accuracy))
 
@@ -1163,6 +1160,7 @@ class TestDSparkFusedLoss(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"SPECFORGE_DSPARK_FUSED_LOSS": "1"}),
+            patch.object(_dflash_module, "_dspark_fused_device", return_value=True),
             patch.object(
                 fused_loss_module, "fused_tv_loss", side_effect=exact_eager_tv
             ) as fused_mock,

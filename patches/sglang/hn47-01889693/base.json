@@ -1,0 +1,32 @@
+{
+  "source": "/HOME/nsccgz_zgchen/nsccgz_zgchen_8/HDD_POOL/xj/src/sglang-dflash2-vl-mrope",
+  "commit": "01889693a51fbf1be2af03f13537d738d49b0978",
+  "patch_sha256": "99fa932a62c703d16c90a0634c17f54f784c6812a37ad091103cac797cb7eb93",
+  "files": {
+    "python/sglang/srt/models/dspark.py": "859d8fb60b77be8552492745435c34a377b85a44a5cb4817fb54e9e469956ac7",
+    "python/sglang/srt/speculative/dspark_components/dspark_draft.py": "61b52c914ab8c8cecfb378ed68e6877a0b9677bd660ef2dd0883fc62bc6cee00",
+    "python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py": "dc7c4597ec105d5b18c1e262698c0d20cd0409ec37bac04d907e526d898aaecb",
+    "python/sglang/srt/speculative/dspark_components/dspark_mrope.py": "d00724ce14cd37406c1a634840b114b060e0c2977d3267ff077837d1413696c0",
+    "python/sglang/srt/speculative/dspark_components/dspark_verify.py": "6cf79e7e4404f8956d610f900cf5e697385736009104363de8bc94ded646b1ed",
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": "0bf62d77ccbddc842e3f8485995e7cea84b73c544de935fffafd0c93644bb94a"
+  },
+  "unchanged_shared_and_target": true,
+  "capture_base_files": {
+    "python/sglang/kernels/ops/layernorm/mhc.py": "d1bf39ee70af251ae539de44fd56671f95d76bcdbb02f816d5f3f25ec55634e3",
+    "python/sglang/srt/layers/logits_processor.py": "43a0674df59067223fb793d78bb9f947049d2f983704a09a3c67282bf654cad0",
+    "python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py": "470a7fa83038e7084738a3eaa46adda01ff073b58fa16bc5c80e710935874ffa",
+    "python/sglang/srt/managers/detokenizer_manager.py": "c54365f78e8f30da1f23edf0347762ed5c878b1b63d1be687971aadc091a6658",
+    "python/sglang/srt/managers/io_struct.py": "b7faa5ff318da732fa21f6bb7bf708b3646960c0143776a03d152ab2df4c7a36",
+    "python/sglang/srt/managers/schedule_batch.py": "348cd231d705a618c3d4a80a356470f92a430a941c97b429a8b5d16336fd035c",
+    "python/sglang/srt/managers/scheduler.py": "c1e895fdf088731383d7a8f732f3386e99e1a4639659ef714a844e0106e73cd2",
+    "python/sglang/srt/managers/scheduler_components/batch_result_processor.py": "702ecd7d908fb15b9c079e837ce72982492fd0cb1bf9436dcf0cdcd0d6c03873",
+    "python/sglang/srt/managers/scheduler_components/output_streamer.py": "4f069fbba82a77360fec29330edf5f6cf3740960984c5e1d01ef4e385c90ecaa",
+    "python/sglang/srt/managers/tokenizer_manager.py": "67abae42e171b663dc4c4afa426147d0d6305ec9824c8e2a8b3560c1a13da9e3",
+    "python/sglang/srt/managers/utils.py": "93354ebe8803308355173d9732db833b9d7a52f1002599c7215e989eca317445",
+    "python/sglang/srt/model_executor/model_runner.py": "2bbe91845a9482d04ce0d1ea870a41397be1b4fbe436e0a2a4f555ae7cc67adb",
+    "python/sglang/srt/server_args.py": "13ccda9c0efeb5a331a7db42487d9af24945551e61880b61d36cfaba38c5bc5e",
+    "python/sglang/srt/spec_capture_sink.py": null,
+    "python/sglang/srt/multimodal/processors/base_processor.py": "5431ca935073feba26f2c188caf443bb4e4ae9421831e1ea6771fa2181bb801c",
+    "python/sglang/srt/models/qwen3_vl.py": "4276580439429f92768ddf49b651939cb5f80587f3e90efcd3fa91d786d2fc5c"
+  }
+}
