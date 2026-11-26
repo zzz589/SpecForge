@@ -28,7 +28,7 @@ class MultimodalRegistrationTest(unittest.TestCase):
         )
         self.assertEqual(
             set(contract.required_tensors),
-            {"input_ids", "loss_mask", "hidden_states"},
+            {"input_ids", "loss_mask", "hidden_states", "position_ids"},
         )
         provider = registration.providers.server_streaming_for("multimodal")
         self.assertEqual(provider.capture_method, "dflash")

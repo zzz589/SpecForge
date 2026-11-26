@@ -299,13 +299,13 @@ def call_sglang(
             continue
         elif message["role"] == "user":
             # Multimodal records: attach the record's images to the first user
-            # turn that carries the <image> placeholder (OpenAI content parts).
+            # turn. Raw-data preparation may already have removed the textual
+            # <image> marker while retaining the top-level image field.
             content = message.get("content")
             if (
                 record_images
                 and not image_attached
                 and isinstance(content, str)
-                and "<image>" in content
             ):
                 try:
                     parts = [_image_url_part(p) for p in record_images]
@@ -439,10 +439,19 @@ def main():
             dummy_data,
             max_tokens=1,
         )
-        if result is not None and result.get("status") == "success":
+        # A one-token readiness probe can be classified as skipped by response
+        # policy checks (for example, an empty non-reasoning response). That
+        # still proves that the OpenAI-compatible server accepted and answered
+        # the request; only an actual error means the server is unavailable.
+        if result is not None and result.get("status") in {"success", "skipped"}:
             valid_server_addresses.append(server_address)
         else:
-            print(f"Server {server_address} is not available")
+            detail = (
+                result.get("error")
+                if isinstance(result, dict)
+                else repr(result)
+            )
+            print(f"Server {server_address} is not available: {detail}")
 
     if len(valid_server_addresses) == 0:
         raise ValueError("No server address is available")

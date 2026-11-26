@@ -38,7 +38,7 @@ def _normalize_hidden_states(
     return hidden_states[:max_len].unsqueeze(0)
 
 
-def normalize_offline_sample(raw, max_len: int):
+def normalize_offline_sample(raw, max_len: int, *, generation_eos_token_id=None):
     """Normalize raw DFlash/Domino capture tensors without target projection."""
 
     input_ids = raw["input_ids"][:max_len].unsqueeze(0)
@@ -61,6 +61,10 @@ def normalize_offline_sample(raw, max_len: int):
             f"loss_mask={loss_mask.shape[1]}, "
             f"hidden_states={hidden_states.shape[1]}"
         )
+    if generation_eos_token_id is not None:
+        from specforge.data.loss_mask import trim_loss_mask_after_eos
+
+        loss_mask = trim_loss_mask_after_eos(input_ids, loss_mask, generation_eos_token_id)
     if not has_consecutive_supervised_tokens(loss_mask[0]):
         raise ValueError(
             "offline DFlash-family samples require two consecutive supervised tokens"
@@ -72,10 +76,10 @@ def normalize_offline_sample(raw, max_len: int):
     }
 
 
-def normalize_dspark_offline_sample(raw, max_len: int):
+def normalize_dspark_offline_sample(raw, max_len: int, *, generation_eos_token_id=None):
     """Normalize DSpark capture tensors, including target final-layer states."""
 
-    normalized = normalize_offline_sample(raw, max_len)
+    normalized = normalize_offline_sample(raw, max_len, generation_eos_token_id=generation_eos_token_id)
     target_last_hidden_states = _normalize_hidden_states(
         raw,
         "target_last_hidden_states",
@@ -145,12 +149,13 @@ def build_dspark_offline_reader(
     )
 
 
-def build_offline_normalizer(max_len, **_topology):
-    return partial(normalize_offline_sample, max_len=max_len)
+def build_offline_normalizer(max_len, *, generation_eos_token_id=None, **_topology):
+    return partial(normalize_offline_sample, max_len=max_len,
+                   generation_eos_token_id=generation_eos_token_id)
 
 
-def build_dspark_offline_normalizer(max_len, **_topology):
-    return partial(normalize_dspark_offline_sample, max_len=max_len)
+def build_dspark_offline_normalizer(max_len, *, generation_eos_token_id=None, **_topology):
+    return partial(normalize_dspark_offline_sample, max_len=max_len, generation_eos_token_id=generation_eos_token_id)
 
 
 def _padded_collator(required_keys, optional_keys=()):
@@ -174,13 +179,14 @@ def build_collator():
     # carries it; offline v1 DFlash and Domino batches omit it.
     return _padded_collator(
         ("input_ids", "loss_mask", "hidden_states"),
-        optional_keys=("target_last_hidden_states",),
+        optional_keys=("target_last_hidden_states", "position_ids"),
     )
 
 
 def build_dspark_collator():
     return _padded_collator(
-        ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states")
+        ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states"),
+        optional_keys=("position_ids",),
     )
 
 

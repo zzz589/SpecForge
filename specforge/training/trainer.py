@@ -338,6 +338,11 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
+                if key == "dflash_compute_config" and key not in state:
+                    from specforge.modeling.draft.dflash_config import validate_dflash_compute_config
+
+                    validate_dflash_compute_config(state, model.draft_model.config)
+                    continue
                 if key in custom_checkpoint_extra and key not in state:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "

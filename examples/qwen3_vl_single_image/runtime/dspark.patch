@@ -1,0 +1,223 @@
+diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
+index 4116f527b8..1727d85fb6 100644
+--- a/python/sglang/srt/models/dspark.py
++++ b/python/sglang/srt/models/dspark.py
+@@ -594,12 +594,23 @@ class DSparkDraftMixin:
+         pool,
+         positions: torch.Tensor,
+         cache_loc: torch.Tensor,
++        rope_positions: Optional[torch.Tensor] = None,
+         cache_loc_2d: Optional[torch.Tensor] = None,
+         commit_lens: Optional[torch.Tensor] = None,
+     ) -> None:
++        if positions.ndim != 1:
++            raise ValueError("DSpark cache positions must remain one-dimensional")
++        if rope_positions is None:
++            rope_positions = positions
++        if not (
++            (rope_positions.ndim == 1 and rope_positions.shape == positions.shape)
++            or (rope_positions.ndim == 2 and rope_positions.shape == (3, positions.numel()))
++        ):
++            raise ValueError("DSpark rotary positions must be [N] or [3, N]")
+         ctx_hidden = self.project_target_hidden(target_hidden)
+ 
+-        bundle = self._fused_kv_write_bundle(pool)
++        # The fused writer indexes a 1-D cosine table; never feed it three axes.
++        bundle = self._fused_kv_write_bundle(pool) if rope_positions.ndim == 1 else None
+         if bundle is not None:
+             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
+                 fused_kv_norm_rope_write,
+@@ -620,7 +631,7 @@ class DSparkDraftMixin:
+                 meta,
+                 knw,
+                 cos_sin,
+-                positions,
++                rope_positions,
+                 locs,
+                 num_layers,
+                 kv_size,
+@@ -634,7 +645,7 @@ class DSparkDraftMixin:
+         stacked = self._stacked_ctx_kv_params()
+         if stacked is not None:
+             k_all, v_all = self._project_ctx_kv_stacked(
+-                ctx_hidden=ctx_hidden, positions=positions, stacked=stacked
++                ctx_hidden=ctx_hidden, positions=rope_positions, stacked=stacked
+             )
+         for i, layer in enumerate(self.layers):
+             attn = layer.self_attn
+@@ -644,7 +655,7 @@ class DSparkDraftMixin:
+             else:
+                 k, v = attn.kv_proj_only(ctx_hidden)
+                 k = attn.apply_k_norm(k)
+-                k = attn.apply_k_rope(positions, k)
++                k = attn.apply_k_rope(rope_positions, k)
+                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+             if cache_loc_2d is not None and commit_lens is not None:
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+index da261b9e85..bd0e9fd261 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from sglang.srt.speculative.dspark_components.dspark_mrope import build_dspark_rope_positions
++
+ import logging
+ from contextlib import nullcontext
+ from typing import Optional
+@@ -303,6 +305,8 @@ class DraftBlockProposer:
+             spec_info=self._draft_block_spec_info,
+             capture_hidden_mode=CaptureHiddenMode.NULL,
+         )
++        if self.draft_model_runner.model_config.model_is_mrope:
++            idle_batch.mrope_positions = empty_long.new_empty((3, 0))
+         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+         with torch.inference_mode():
+             self.draft_model_runner.forward(idle_batch)
+@@ -366,6 +370,13 @@ class DraftBlockProposer:
+             num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
+             num_token_non_padded_cpu=draft_num_tokens,
+         )
++        if self.draft_model_runner.model_config.model_is_mrope:
++            draft_forward_batch.mrope_positions = build_dspark_rope_positions(
++                batch=batch,
++                logical_positions=draft_positions,
++                token_counts=[gamma] * bs,
++                use_mrope=True,
++            )
+         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+         if (
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py b/python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py
+index baaf55eb7e..32861bb831 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py
+@@ -1,3 +1,4 @@
++from sglang.srt.speculative.dspark_components.dspark_mrope import build_dspark_rope_positions
+ from typing import Optional
+ 
+ import torch
+@@ -38,6 +39,7 @@ class TargetHiddenKvInjector:
+         target_hidden: torch.Tensor,
+         cache_loc: torch.Tensor,
+         positions: torch.Tensor,
++        rope_positions: Optional[torch.Tensor] = None,
+         cache_loc_2d: Optional[torch.Tensor] = None,
+         commit_lens: Optional[torch.Tensor] = None,
+         state_slot: Optional[torch.Tensor] = None,
+@@ -48,6 +50,13 @@ class TargetHiddenKvInjector:
+         device = self.model_runner.device
+         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
+         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
++        use_mrope = bool(self.draft_model_runner.model_config.model_is_mrope)
++        if use_mrope and rope_positions is None:
++            raise ValueError("DSpark mRoPE KV injection requires explicit rotary positions")
++        if rope_positions is not None:
++            rope_positions = rope_positions.to(device=device, dtype=torch.int64, non_blocking=True)
++        if use_mrope and (rope_positions.ndim != 2 or rope_positions.shape != (3, positions.numel())):
++            raise ValueError("DSpark mRoPE positions must have shape [3, N]")
+         target_hidden = target_hidden.to(device=device, non_blocking=True)
+         n_real = positions.shape[0]
+         if target_hidden.shape[0] > n_real:
+@@ -71,6 +80,8 @@ class TargetHiddenKvInjector:
+ 
+         pool = self.draft_model_runner.token_to_kv_pool
+         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
++            if use_mrope:
++                raise NotImplementedError("DSpark mRoPE is supported for the dense Qwen Draft, not MLA")
+             self._inject_mla(
+                 pool=pool,
+                 target_hidden=target_hidden,
+@@ -88,6 +99,7 @@ class TargetHiddenKvInjector:
+                 target_hidden=target_hidden,
+                 pool=pool,
+                 positions=positions,
++                rope_positions=rope_positions,
+                 cache_loc=cache_loc,
+                 cache_loc_2d=cache_loc_2d,
+                 commit_lens=commit_lens,
+@@ -186,6 +198,8 @@ class TargetHiddenKvInjector:
+ 
+         pool = self.draft_model_runner.token_to_kv_pool
+         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
++            if self.draft_model_runner.model_config.model_is_mrope:
++                raise NotImplementedError("DSpark mRoPE is supported for the dense Qwen Draft, not MLA")
+             if hidden_strided.numel() == 0:
+                 return
+             if is_unified_kv_triton():
+@@ -217,6 +231,12 @@ class TargetHiddenKvInjector:
+             return
+ 
+         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
++        rope_positions = build_dspark_rope_positions(
++            batch=batch,
++            logical_positions=positions_2d.reshape(-1),
++            token_counts=[stride] * bs,
++            use_mrope=bool(self.draft_model_runner.model_config.model_is_mrope),
++        )
+         verify_cache_loc = assign_extend_cache_locs_func(
+             req_pool_indices=batch.req_pool_indices,
+             req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+@@ -232,5 +252,6 @@ class TargetHiddenKvInjector:
+             cache_loc=verify_cache_loc,
+             cache_loc_2d=verify_cache_loc_2d,
+             positions=positions_2d.reshape(-1),
++            rope_positions=rope_positions,
+             commit_lens=commit_lens,
+         )
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+index f486400c83..b8b3ed7b34 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from sglang.srt.speculative.dspark_components.dspark_mrope import build_dspark_rope_positions
++
+ from typing import Optional
+ 
+ import msgspec
+@@ -341,6 +343,12 @@ class TargetVerifyExecutor:
+             cache_loc=verify_window.verify_cache_loc,
+             cache_loc_2d=verify_window.verify_cache_loc_2d,
+             positions=verify_window.positions_2d.reshape(-1),
++            rope_positions=build_dspark_rope_positions(
++                batch=batch,
++                logical_positions=verify_window.positions_2d.reshape(-1),
++                token_counts=[self.verify_num_draft_tokens] * bs,
++                use_mrope=bool(self.kv_injector.draft_model_runner.model_config.model_is_mrope),
++            ),
+             commit_lens=commit_lens,
+             state_slot=state_slot,
+         )
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index 666cfd8c0b..9c1f3c7bab 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -1,3 +1,4 @@
++from sglang.srt.speculative.dspark_components.dspark_mrope import build_dspark_rope_positions
+ import logging
+ from contextlib import nullcontext
+ from dataclasses import replace
+@@ -476,6 +477,12 @@ class DSparkWorkerV2(BaseSpecWorker):
+             ctx_lens,
+             int(sum(batch.extend_lens)),
+         )
++        rope_positions = build_dspark_rope_positions(
++            batch=batch,
++            logical_positions=positions,
++            token_counts=batch.extend_lens,
++            use_mrope=bool(self.draft_model_runner.model_config.model_is_mrope),
++        )
+         # unified_kv injects into the SWA ring keyed by (draft req slot, position);
+         # thread the per-token state_slot + the req's final position so the
+         # injector keeps only the last SWA window (older prefill tokens share a
+@@ -493,6 +500,7 @@ class DSparkWorkerV2(BaseSpecWorker):
+             target_hidden=logits_output.hidden_states,
+             cache_loc=batch.out_cache_loc,
+             positions=positions,
++            rope_positions=rope_positions,
+             state_slot=state_slot,
+             final_pos=final_pos,
+         )

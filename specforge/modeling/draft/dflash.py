@@ -34,6 +34,94 @@ SLIDING_ATTENTION = "sliding_attention"
 _VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
 
 
+def get_rope_scaling_value(config: Qwen3Config, key: str, default=None):
+    """Read a RoPE option from both dict and config-object representations."""
+
+    rope_scaling = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None)
+    if rope_scaling is None:
+        return default
+    if isinstance(rope_scaling, dict):
+        return rope_scaling.get(key, default)
+    return getattr(rope_scaling, key, default)
+
+
+class Qwen3InterleavedMultiRotaryEmbedding(Qwen3RotaryEmbedding):
+    """Qwen3-VL interleaved mRoPE over temporal, height, and width axes."""
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__(config)
+        self._mrope_theta = float(get_rope_scaling_value(
+            config, "rope_theta", getattr(config, "rope_theta", 10000.0)
+        ))
+        self.mrope_section = get_rope_scaling_value(config, "mrope_section")
+        if (not isinstance(self.mrope_section, (list, tuple))
+                or len(self.mrope_section) != 3
+                or any(type(n) is not int or n < 0 for n in self.mrope_section)
+                or sum(self.mrope_section) != self.inv_freq.numel()):
+            raise ValueError("mrope_section must contain three nonnegative integers summing to rotary_dim/2")
+        width = self.inv_freq.numel()
+        if any(len(range(axis, min(width, 3 * self.mrope_section[axis]), 3))
+               != self.mrope_section[axis] for axis in (1, 2)):
+            raise ValueError("mrope_section does not fit the interleaved rotary layout")
+        if get_rope_scaling_value(config, "rope_type", "default") != "default":
+            raise ValueError("Qwen3-VL mRoPE currently requires default frequency scaling")
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        # Module.to(bfloat16) also casts nonpersistent buffers. Recreate default
+        # frequencies in FP32 rather than upcasting already-rounded BF16 values.
+        dim = 2 * self.inv_freq.numel()
+        powers = torch.arange(0, dim, 2, device=self.inv_freq.device, dtype=torch.int64).float() / dim
+        self.inv_freq = 1.0 / (self._mrope_theta ** powers)
+        if hasattr(self, "original_inv_freq"):
+            self.original_inv_freq = self.inv_freq.clone()
+        return result
+
+    def _apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
+        interleaved = freqs[0].clone()
+        for dim_idx, offset in enumerate((1, 2), start=1):
+            length = self.mrope_section[dim_idx] * 3
+            idx_slice = slice(offset, length, 3)
+            interleaved[..., idx_slice] = freqs[dim_idx, ..., idx_slice]
+        return interleaved
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(
+                3, position_ids.shape[0], -1
+            )
+        if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+            raise ValueError(
+                "Qwen3-VL mRoPE position_ids must have shape [3, B, S] "
+                f"or [B, S], got {tuple(position_ids.shape)}"
+            )
+
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
+            interleaved_freqs = self._apply_interleaved_mrope(freqs)
+            emb = torch.cat((interleaved_freqs, interleaved_freqs), dim=-1)
+            scaling = getattr(self, "attention_scaling", 1.0)
+            cos = emb.cos() * scaling
+            sin = emb.sin() * scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
@@ -724,9 +812,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(
-            _rope_config(config, self.attention_mode)
-        )
+        rope_config = _rope_config(config, self.attention_mode)
+        section = get_rope_scaling_value(rope_config, "mrope_section")
+        self.use_interleaved_mrope = get_rope_scaling_value(
+            rope_config, "mrope_interleaved", False
+        ) is True
+        if section is not None and not self.use_interleaved_mrope:
+            raise ValueError("mrope_section requires mrope_interleaved=true for Qwen3-VL")
+        if self.use_interleaved_mrope and self.attention_mode == "mla":
+            raise ValueError("Qwen3-VL mRoPE is supported for GQA/MHA, not MLA")
+        rotary_cls = Qwen3InterleavedMultiRotaryEmbedding if self.use_interleaved_mrope else Qwen3RotaryEmbedding
+        self.rotary_emb = rotary_cls(rope_config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,

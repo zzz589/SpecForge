@@ -31,6 +31,7 @@ def _prompt_config():
             cache_dir=None,
             trust_remote_code=False,
         ),
+        training=SimpleNamespace(strategy="dspark"),
         data=SimpleNamespace(
             prompts_path=None,
             train_data_path="train.jsonl",
@@ -57,18 +58,19 @@ class DSparkMultimodalRegistrationTest(unittest.TestCase):
                 "loss_mask",
                 "hidden_states",
                 "target_last_hidden_states",
+                "position_ids",
             },
         )
         self.assertEqual({"hidden_state"}, set(contract.allowed_target_representations))
         self.assertEqual("hidden_state", contract.default_target_representation)
 
-    def test_multimodal_provider_mirrors_the_text_capture_layout(self):
+    def test_multimodal_provider_adds_triplets_to_text_capture_layout(self):
         providers = self.registry.resolve("dspark").providers
         provider = providers.server_streaming_for("multimodal")
         text = providers.server_streaming_for("text")
         self.assertEqual("dspark", provider.capture_method)
         self.assertEqual("hidden_state", provider.target_representation)
-        self.assertEqual(text.layout, provider.layout)
+        self.assertEqual(provider.layout.passthrough, text.layout.passthrough + (("position_ids", "position_ids", (3,)),))
         self.assertEqual("hidden_states", provider.layout.aux_feature)
         self.assertEqual(
             "target_last_hidden_states", provider.layout.last_hidden_feature
@@ -106,13 +108,14 @@ class DSparkMinLossTokensTest(unittest.TestCase):
                 "transformers.AutoProcessor.from_pretrained",
                 return_value=object(),
             ),
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=SimpleNamespace(model_type="qwen3_vl")),
             mock.patch(
                 "specforge.data.vlm_preprocessing.build_vlm_prompt_payloads",
                 side_effect=fake_build_payloads,
             ),
         ):
             prompts = adapter.prepare_prompts(
-                config, object(), draft_config=draft_config
+                config, SimpleNamespace(eos_token_id=7), draft_config=draft_config
             )
         self.assertEqual([{"input_ids": [1]}], prompts)
         return captured
@@ -181,8 +184,7 @@ class DSparkVlmRequestInputsTest(unittest.TestCase):
 
 @unittest.skipUnless(TORCH_AVAILABLE, "requires torch")
 class DSparkMultimodalCollatorTest(unittest.TestCase):
-    """Multimodal batches are isomorphic to text batches (plain-rope design):
-    the multimodal provider reuses the DSpark collator verbatim."""
+    """Multimodal batches add three-axis positions to the shared collator."""
 
     def test_multimodal_collator_pads_all_four_features(self):
         short = {

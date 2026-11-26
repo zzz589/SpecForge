@@ -37,6 +37,7 @@ from specforge.algorithms.contracts import (
     OfflineStorageContract,
 )
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
+from .offline_data import prepare_offline_data
 
 ALGORITHM_NAME = "dflash"
 DRAFT_ARCHITECTURE = "DFlashDraftModel"
@@ -66,7 +67,10 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
 
+    from specforge.modeling.draft.dflash_config import COMPUTE_CONFIG_KEY, dflash_compute_config
+
     contract = {
+        COMPUTE_CONFIG_KEY: dflash_compute_config(draft_model.config),
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -81,7 +85,19 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_lk_loss_type": training_model.lk_loss_type,
         "dflash_kl_scale": float(training_model.kl_scale),
         "dflash_kl_decay": float(training_model.kl_decay),
+        "dflash_generation_mask": "first_eos_in_supervised_run_v1",
+        "dflash_objective_normalization": "global_weight_sum_per_optimizer_step_v1",
     }
+    if getattr(draft_model, "use_interleaved_mrope", False):
+        from specforge.modeling.draft.dflash import get_rope_scaling_value
+
+        contract["dflash_position_convention"] = "qwen3_vl_triplets_anchor_continuation_v1"
+        contract["dflash_mrope_section"] = tuple(
+            get_rope_scaling_value(draft_model.config, "mrope_section")
+        )
+        contract["dflash_mrope_theta"] = get_rope_scaling_value(
+            draft_model.config, "rope_theta", getattr(draft_model.config, "rope_theta", None)
+        )
     if getattr(draft_model, "candidate_selector", None) is not None:
         method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
         contract.update(
@@ -136,6 +152,10 @@ def resolve_dflash_kernels(config, draft_config):
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_dflash_draft
 
+    if config.model.input_modality == "multimodal":
+        from specforge.modeling.draft.dflash import get_rope_scaling_value
+        if get_rope_scaling_value(draft_config, "mrope_interleaved", False) is not True:
+            raise ValueError("DFlash-VL requires an explicit mRoPE draft config; use configs/qwen3-vl-4b-dflash-mrope.json")
     return build_dflash_draft(
         config,
         draft_config,
@@ -145,7 +165,16 @@ def build_draft(config, draft_config):
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
     from specforge.algorithms.model_providers import build_dflash_model
+    from specforge.modeling.target.target_utils import target_text_config
 
+    if getattr(draft_model.config, "eos_token_id", None) is None:
+        draft_model.config.eos_token_id = getattr(target_text_config(target_config), "eos_token_id", None)
+
+    if config.model.input_modality == "multimodal":
+        if getattr(target_config, "model_type", None) != "qwen3_vl":
+            raise ValueError("This DFlash-VL mRoPE path supports Qwen3-VL still images only")
+        if not getattr(draft_model, "use_interleaved_mrope", False):
+            raise ValueError("DFlash-VL requires an mRoPE-enabled draft")
     return build_dflash_model(
         config,
         draft_model,
@@ -193,6 +222,11 @@ def select_server_capture_layout(config):
     return replace(SERVER_CAPTURE_LAYOUT, last_hidden_feature=None)
 
 
+def select_multimodal_capture_layout(config):
+    layout = select_server_capture_layout(config)
+    return replace(layout, passthrough=layout.passthrough + (("position_ids", "position_ids", (3,)),))
+
+
 def algorithm_spec() -> AlgorithmSpec:
     ready = {"input_ids", "loss_mask", "hidden_states"}
     return AlgorithmSpec(
@@ -221,7 +255,7 @@ def algorithm_spec() -> AlgorithmSpec:
             FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="multimodal",
-                required_tensors=ready,
+                required_tensors=ready | {"position_ids"},
             ),
         ),
         capabilities=AlgorithmCapabilities(
@@ -277,6 +311,7 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_reader=partial(build_offline_reader, ALGORITHM_NAME),
+                prepare_data=prepare_offline_data,
                 build_normalizer=build_offline_normalizer,
                 build_collator=collator,
             ),
@@ -296,12 +331,14 @@ def algorithm_providers() -> AlgorithmProviders:
                 target_representation=None,
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_states",
-                    last_hidden_feature=None,
+                    last_hidden_feature="target_last_hidden_states",
                     passthrough=(
                         ("input_ids", "input_ids", ()),
                         ("loss_mask", "loss_mask", ()),
+                        ("position_ids", "position_ids", (3,)),
                     ),
                 ),
+                select_layout=select_multimodal_capture_layout,
                 build_collator=collator,
                 build_input_adapter=build_vlm_input_adapter,
             ),

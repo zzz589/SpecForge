@@ -154,6 +154,10 @@ class TrainingBackend(abc.ABC):
     @abc.abstractmethod
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
+    def accumulation_context(self, *, is_boundary: bool):
+        from contextlib import nullcontext
+        return nullcontext()
+
     @abc.abstractmethod
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
 
@@ -332,17 +336,15 @@ class FSDPTrainingBackend(TrainingBackend):
                 ),
             )
 
-    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
-        """Backward one micro-step with one gradient collective per window.
+    def accumulation_context(self, *, is_boundary: bool):
+        from contextlib import nullcontext
+        if self._wrapped and not is_boundary:
+            return self.module.no_sync()
+        return nullcontext()
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
-        """
-        if is_boundary or not self._wrapped:
-            loss.backward()
-        else:
-            with self.module.no_sync():
-                loss.backward()
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        # TrainerCore keeps forward AND backward in accumulation_context.
+        loss.backward()
 
     def scale_gradients(self, factor: torch.Tensor) -> None:
         if self.module is None:

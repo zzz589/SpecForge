@@ -414,6 +414,10 @@ class ModelConfig(StrictConfigModel):
 class DataConfig(StrictConfigModel):
     #: online mode — raw conversation JSON/JSONL.
     train_data_path: str = ""
+    #: Optional complete generation journal for exact single-turn token ingestion.
+    exact_journal_path: Optional[str] = None
+    #: Optional sharded Arrow cache; tokens remain bound to the source records.
+    mapped_manifest_path: Optional[str] = None
     #: online mode — already-tokenized JSONL records.
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
@@ -1131,6 +1135,15 @@ class Config(StrictConfigModel):
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
+        for name in ("exact_journal_path", "mapped_manifest_path"):
+            path = getattr(self.data, name)
+            if path is not None and (not path.strip() or self.mode != "online"
+                    or self.model.input_modality != "multimodal"):
+                raise ValueError(f"{name} requires online multimodal input")
+        if self.data.exact_journal_path is not None and (
+            self.data.mapped_manifest_path or self.data.max_prompts not in (None, 0)
+        ):
+            raise ValueError("exact_journal_path requires complete online multimodal raw input")
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role

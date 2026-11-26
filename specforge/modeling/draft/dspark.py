@@ -325,7 +325,10 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> torch.LongTensor:
         """Generate a block with the same Markov correction used in training."""
 
-        proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        # DSpark slot 0 predicts the first token after the clean anchor. The
+        # inherited generation loop has B-1 proposal slots, so omit the final
+        # prediction, not the first one (which is unsupervised only in DFlash).
+        proposal_hidden = draft_hidden[:, -self.block_size : -1, :]
         base_logits = target.lm_head(proposal_hidden)
         if self.markov_head is None:
             return _sample(base_logits)
